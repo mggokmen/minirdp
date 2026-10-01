@@ -1,0 +1,7 @@
+{
+  "host": "0.0.0.0",
+  "port": 8765,
+  "quality": 65,
+  "max_width": 1920,
+  "resolution": [1920, 1080]
+}

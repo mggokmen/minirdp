@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MiniRDP</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif}
+#screen{position:absolute;inset:0;margin:auto;max-width:100%;max-height:100%;cursor:default;outline:none}
+#bar{position:fixed;top:0;left:50%;transform:translate(-50%,calc(-100% + 6px));display:flex;gap:8px;align-items:center;
+  background:#2a2c33ee;color:#eee;padding:6px 10px;border-radius:0 0 10px 10px;font-size:13px;transition:transform .15s;z-index:10}
+#bar:hover,#bar.pin{transform:translate(-50%,0)}
+#bar button,#bar select{background:#3a3d46;color:#eee;border:0;border-radius:5px;padding:5px 9px;font-size:13px;cursor:pointer}
+#bar label{display:flex;gap:4px;align-items:center;cursor:pointer}
+#status{min-width:110px;opacity:.8}
+#clip{position:fixed;top:48px;left:50%;transform:translateX(-50%);background:#2a2c33;color:#eee;padding:12px;border-radius:10px;
+  display:none;flex-direction:column;gap:8px;z-index:11;width:min(520px,90vw)}
+#clip textarea{height:140px;background:#1e1f24;color:#eee;border:1px solid #444;border-radius:6px;padding:8px;font-size:14px}
+#clip div{display:flex;gap:8px}
+#clip button{flex:1;background:#3a3d46;color:#eee;border:0;border-radius:5px;padding:7px;cursor:pointer}
+#msg{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#aaa;font-size:18px;pointer-events:none}
+</style></head><body>
+<canvas id="screen" tabindex="0"></canvas>
+<div id="msg">Bağlanıyor…</div>
+<div id="bar">
+  <span id="status">—</span>
+  <button id="fs" title="Tam ekranda Alt+Tab, Win tuşu vb. de Mac'e gider">⛶ Tam ekran</button>
+  <label title="Windows'taki Ctrl tuşu Mac'te ⌘ (Command) olarak gönderilir; Ctrl+C / Ctrl+V doğal çalışır"><input type="checkbox" id="ctrlcmd" checked> Ctrl→⌘</label>
+  <select id="quality" title="Görüntü kalitesi">
+    <option value="45,1280">Hızlı</option>
+    <option value="65,1920" selected>Dengeli</option>
+    <option value="85,0">Net</option>
+  </select>
+  <button id="clipbtn">📋 Pano</button>
+  <button id="pin" title="Çubuğu sabitle">📌</button>
+  <button onclick="location.href='/logout'">Çıkış</button>
+</div>
+<div id="clip">
+  <textarea id="cliptext" placeholder="Mac'e göndermek istediğiniz metni buraya yapıştırın (Ctrl+V)…"></textarea>
+  <div>
+    <button id="toMac">Mac panosuna gönder</button>
+    <button id="typeMac">Mac'te yaz</button>
+    <button id="fromMac">Mac panosunu al</button>
+    <button id="clipClose">Kapat</button>
+  </div>
+</div>
+<script>
+const cv = document.getElementById('screen'), ctx = cv.getContext('2d');
+const msg = document.getElementById('msg'), statusEl = document.getElementById('status');
+const clip = document.getElementById('clip'), clipText = document.getElementById('cliptext');
+const ctrlCmd = document.getElementById('ctrlcmd'), quality = document.getElementById('quality');
+let ws = null, frames = 0, retry = 500;
+const held = new Set();      // Mac'e basılı olarak gönderilmiş tuş kodları
+const typed = new Set();     // karakter olarak yazılmış tuşlar (keyup gönderilmez)
+
+try { ctrlCmd.checked = localStorage.getItem('ctrlcmd') !== '0';
+      const q = localStorage.getItem('quality'); if (q && [...quality.options].some(o => o.value === q)) quality.value = q; } catch (e) {}
+
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function sendCfg() {
+  const [q, w] = quality.value.split(',').map(Number);
+  send({t: 'cfg', quality: q, max_width: w});
+}
+
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.binaryType = 'blob';
+  ws.onopen = () => { retry = 500; msg.style.display = 'none'; sendCfg(); cv.focus(); };
+  ws.onmessage = async ev => {
+    try {
+      const bmp = await createImageBitmap(ev.data);
+      if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; }
+      ctx.drawImage(bmp, 0, 0); bmp.close(); frames++;
+    } finally { send({t: 'ack'}); }
+  };
+  ws.onclose = async () => {
+    msg.textContent = 'Bağlantı koptu, yeniden bağlanılıyor…'; msg.style.display = 'flex';
+    releaseAll();
+    const r = await fetch('/', {method: 'GET', cache: 'no-store'}).then(r => r.text()).catch(() => '');
+    if (r.includes('name="password"')) { location.reload(); return; }   // oturum düşmüş → giriş sayfası
+    setTimeout(connect, retry); retry = Math.min(retry * 2, 5000);
+  };
+}
+setInterval(() => { statusEl.textContent = ws && ws.readyState === 1 ? `● Bağlı · ${frames} fps` : '○ Bağlı değil'; frames = 0; }, 1000);
+
+// ---------- fare
+function pos(e) {
+  const r = cv.getBoundingClientRect();
+  return {x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height};
+}
+let pendingMove = null;
+cv.addEventListener('mousemove', e => {
+  if (!pendingMove) requestAnimationFrame(() => { send(pendingMove); pendingMove = null; });
+  pendingMove = {t: 'mm', ...pos(e)};
+});
+cv.addEventListener('mousedown', e => { e.preventDefault(); cv.focus(); send({t: 'md', b: e.button, ...pos(e)}); });
+window.addEventListener('mouseup', e => { if (e.target === cv || document.activeElement === cv) send({t: 'mu', b: e.button, ...pos(e)}); });
+cv.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+  send({t: 'wh', dx: e.deltaX * k, dy: e.deltaY * k});
+}, {passive: false});
+
+// ---------- klavye
+function mapCode(code) {
+  if (ctrlCmd.checked) {
+    if (code === 'ControlLeft') return 'MetaLeft';
+    if (code === 'ControlRight') return 'MetaRight';
+    if (code === 'MetaLeft' || code === 'OSLeft') return 'ControlLeft';
+  }
+  return code;
+}
+function isPrintable(e) {
+  if (e.key.length !== 1) return false;
+  const altGr = e.getModifierState('AltGraph');
+  if (altGr) return true;                       // ör. Türkçe klavyede AltGr+Q = @
+  return !e.ctrlKey && !e.metaKey && !e.altKey;
+}
+function keyActive() { return document.activeElement === cv || document.fullscreenElement; }
+
+window.addEventListener('keydown', e => {
+  if (!keyActive() || clip.style.display === 'flex') return;
+  e.preventDefault();
+  if (e.key === 'Dead') return;
+  if (isPrintable(e)) { typed.add(e.code); send({t: 'tx', s: e.key}); return; }
+  const c = mapCode(e.code); held.add(c); send({t: 'kd', code: c});
+});
+window.addEventListener('keyup', e => {
+  if (!keyActive() || clip.style.display === 'flex') return;
+  e.preventDefault();
+  if (typed.delete(e.code)) return;
+  const c = mapCode(e.code);
+  if (held.delete(c)) send({t: 'ku', code: c});
+});
+function releaseAll() { for (const c of held) send({t: 'ku', code: c}); held.clear(); typed.clear(); }
+window.addEventListener('blur', releaseAll);
+
+// ---------- çubuk
+document.getElementById('fs').onclick = async () => {
+  if (document.fullscreenElement) { await document.exitFullscreen(); return; }
+  await document.documentElement.requestFullscreen();
+  try { await navigator.keyboard.lock(); } catch (e) {}
+  cv.focus();
+};
+document.getElementById('pin').onclick = () => document.getElementById('bar').classList.toggle('pin');
+ctrlCmd.onchange = () => { releaseAll(); try { localStorage.setItem('ctrlcmd', ctrlCmd.checked ? '1' : '0'); } catch (e) {} cv.focus(); };
+quality.onchange = () => { sendCfg(); try { localStorage.setItem('quality', quality.value); } catch (e) {} cv.focus(); };
+
+// ---------- pano
+document.getElementById('clipbtn').onclick = () => { releaseAll(); clip.style.display = 'flex'; clipText.focus(); };
+document.getElementById('clipClose').onclick = () => { clip.style.display = 'none'; cv.focus(); };
+document.getElementById('toMac').onclick = async () => {
+  await fetch('/clipboard', {method: 'POST', body: clipText.value});
+  clip.style.display = 'none'; cv.focus();
+};
+document.getElementById('typeMac').onclick = () => { send({t: 'tx', s: clipText.value}); clip.style.display = 'none'; cv.focus(); };
+document.getElementById('fromMac').onclick = async () => {
+  clipText.value = await fetch('/clipboard').then(r => r.text());
+  clipText.select();
+  try { document.execCommand('copy'); } catch (e) {}
+};
+
+connect();
+</script>
+</body></html>

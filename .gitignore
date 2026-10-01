@@ -1,0 +1,11 @@
+# Gizli / makineye özel
+config.json
+sessions.json
+certs/
+*.log
+
+# Derleme çıktıları
+venv/
+__pycache__/
+MiniRDP.app/
+.DS_Store
