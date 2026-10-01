@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """MiniRDP - aynı ağdaki bir tarayıcıdan bu Mac'i görüntüleyip kontrol etmek için mini uzak masaüstü sunucusu."""
 import asyncio
+import ctypes
+import ctypes.util
 import hashlib
 import hmac
 import io
@@ -184,9 +186,72 @@ MOUSE = {  # js button -> (down, up, dragged, quartz button)
 }
 
 
+class LayoutMap:
+    """Karakter -> (tuş kodu, Shift/Option) eşlemesi; Mac'in o anki klavye düzeninden çıkarılır.
+
+    Bazı uygulamalar (ör. iOS Simülatörü) olaydaki Unicode metni değil tuş kodunu okur,
+    bu yüzden karakterler doğru tuş koduyla gönderilmelidir.
+    """
+
+    SHIFT, OPTION = 2, 8  # UCKeyTranslate modifierKeyState >> 8
+
+    def __init__(self):
+        self._carbon = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Carbon.framework/Carbon")
+        self._cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+        c, cf = self._carbon, self._cf
+        c.TISCopyCurrentKeyboardLayoutInputSource.restype = ctypes.c_void_p
+        c.TISGetInputSourceProperty.restype = ctypes.c_void_p
+        c.TISGetInputSourceProperty.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        c.LMGetKbdType.restype = ctypes.c_uint8
+        c.UCKeyTranslate.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_uint16),
+        ]
+        cf.CFDataGetBytePtr.restype = ctypes.c_void_p
+        cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        self._key = ctypes.c_void_p.in_dll(c, "kTISPropertyUnicodeKeyLayoutData")
+        self._map = {}
+        self._built = 0.0
+
+    def _build(self):
+        c, cf = self._carbon, self._cf
+        src = c.TISCopyCurrentKeyboardLayoutInputSource()
+        try:
+            data = c.TISGetInputSourceProperty(src, self._key)
+            if not data:
+                return {}
+            layout = cf.CFDataGetBytePtr(data)
+            kbd = c.LMGetKbdType()
+            m = {}
+            for mods in (0, self.SHIFT, self.OPTION, self.SHIFT | self.OPTION):
+                for kc in range(128):
+                    dead, n, buf = ctypes.c_uint32(0), ctypes.c_ulong(0), (ctypes.c_uint16 * 4)()
+                    # 1 = kUCKeyTranslateNoDeadKeysBit
+                    c.UCKeyTranslate(layout, kc, 0, mods, kbd, 1, ctypes.byref(dead), 4, ctypes.byref(n), buf)
+                    if n.value == 1:
+                        ch = chr(buf[0])
+                        if ch.isprintable() and ch not in m:
+                            m[ch] = (kc, mods)
+            return m
+        finally:
+            cf.CFRelease(src)
+
+    def lookup(self, ch):
+        if time.time() - self._built > 10:  # klavye düzeni değişmiş olabilir
+            try:
+                self._map = self._build()
+            except Exception:
+                log.exception("Klavye düzeni okunamadı")
+            self._built = time.time()
+        return self._map.get(ch)
+
+
 class InputController:
     def __init__(self):
         self.src = Q.CGEventSourceCreate(Q.kCGEventSourceStateHIDSystemState)
+        self.layout = LayoutMap()
         self.mods = set()
         self.buttons = set()
         self.click = {"t": 0.0, "b": None, "pos": (0, 0), "n": 0}
@@ -252,11 +317,26 @@ class InputController:
     def type_text(self, s):
         s = str(s)[:2000]
         for ch in s:
+            if ch == "\n":
+                ch = "\r"
             n = len(ch.encode("utf-16-le")) // 2
+            hit = self.layout.lookup(ch)
+            kc, flags = 0, 0
+            if hit:
+                kc, mods = hit
+                if mods & LayoutMap.SHIFT:
+                    flags |= Q.kCGEventFlagMaskShift
+                if mods & LayoutMap.OPTION:
+                    flags |= Q.kCGEventFlagMaskAlternate
+            elif ch == "\r":
+                kc = KEYCODES["Enter"]
+            elif ch == "\t":
+                kc = KEYCODES["Tab"]
             for down in (True, False):
-                ev = Q.CGEventCreateKeyboardEvent(self.src, 0, down)
+                # Hem doğru tuş kodu (Simülatör vb. için) hem de Unicode metin (diğer uygulamalar için).
+                ev = Q.CGEventCreateKeyboardEvent(self.src, kc, down)
                 Q.CGEventKeyboardSetUnicodeString(ev, n, ch)
-                Q.CGEventSetFlags(ev, 0)
+                Q.CGEventSetFlags(ev, flags)
                 Q.CGEventPost(Q.kCGHIDEventTap, ev)
 
     def release_all(self):
