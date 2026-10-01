@@ -64,6 +64,11 @@ function connect() {
   ws.binaryType = 'blob';
   ws.onopen = () => { retry = 500; msg.style.display = 'none'; sendCfg(); cv.focus(); };
   ws.onmessage = async ev => {
+    if (typeof ev.data === 'string') {           // JSON: sunucudan gelen pano vb.
+      const m = JSON.parse(ev.data);
+      if (m.t === 'clip') writeLocalClip(m.s);
+      return;
+    }
     try {
       const bmp = await createImageBitmap(ev.data);
       if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; }
@@ -116,21 +121,47 @@ function isPrintable(e) {
 }
 function keyActive() { return document.activeElement === cv || document.fullscreenElement; }
 
+// Klavye olayları sırayla gider; Ctrl+V'de önce pano Mac'e aktarılır, sonra tuş gönderilir.
+let keyQueue = Promise.resolve();
+function ksend(o) { keyQueue = keyQueue.then(() => send(o)); }
+
 window.addEventListener('keydown', e => {
   if (!keyActive() || clip.style.display === 'flex') return;
   e.preventDefault();
   if (e.key === 'Dead') return;
-  if (isPrintable(e)) { typed.add(e.code); send({t: 'tx', s: e.key}); return; }
-  const c = mapCode(e.code); held.add(c); send({t: 'kd', code: c});
+  if (isPrintable(e)) { typed.add(e.code); ksend({t: 'tx', s: e.key}); return; }
+  if (e.code === 'KeyV' && (e.ctrlKey || e.metaKey) && !e.repeat) keyQueue = keyQueue.then(pushLocalClip);
+  const c = mapCode(e.code); held.add(c); ksend({t: 'kd', code: c});
 });
 window.addEventListener('keyup', e => {
   if (!keyActive() || clip.style.display === 'flex') return;
   e.preventDefault();
   if (typed.delete(e.code)) return;
   const c = mapCode(e.code);
-  if (held.delete(c)) send({t: 'ku', code: c});
+  if (held.delete(c)) ksend({t: 'ku', code: c});
 });
-function releaseAll() { for (const c of held) send({t: 'ku', code: c}); held.clear(); typed.clear(); }
+function releaseAll() { for (const c of held) ksend({t: 'ku', code: c}); held.clear(); typed.clear(); }
+
+// ---------- otomatik pano eşitleme (HTTPS gerektirir)
+const canClip = window.isSecureContext && navigator.clipboard;
+let lastClip = null, pendingClip = null;
+function writeLocalClip(text) {                  // Mac → Windows
+  lastClip = text;
+  if (!canClip) return;
+  if (!document.hasFocus()) { pendingClip = text; return; }
+  navigator.clipboard.writeText(text).then(() => { pendingClip = null; }, () => { pendingClip = text; });
+}
+async function pushLocalClip() {                 // Windows → Mac
+  if (!canClip || !document.hasFocus()) return;
+  try {
+    const text = await Promise.race([navigator.clipboard.readText(), new Promise((_, no) => setTimeout(no, 3000))]);
+    if (text && text !== lastClip) { lastClip = text; send({t: 'clip', s: text}); }
+  } catch (e) {}
+}
+window.addEventListener('focus', () => {
+  if (pendingClip !== null) writeLocalClip(pendingClip);
+  else keyQueue = keyQueue.then(pushLocalClip);
+});
 window.addEventListener('blur', releaseAll);
 
 // ---------- çubuk

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import mss
 import Quartz as Q
+from AppKit import NSPasteboard, NSPasteboardTypeString
 from aiohttp import WSMsgType, web
 from PIL import Image
 
@@ -385,18 +386,33 @@ async def ca_cert(request):
     })
 
 
+CLIP_MAX = 256 * 1024  # karakter
+
+
+def clip_count():
+    return NSPasteboard.generalPasteboard().changeCount()
+
+
+def clip_read():
+    return NSPasteboard.generalPasteboard().stringForType_(NSPasteboardTypeString) or ""
+
+
+def clip_write(text):
+    pb = NSPasteboard.generalPasteboard()
+    pb.clearContents()
+    pb.setString_forType_(text, NSPasteboardTypeString)
+
+
 async def clipboard_get(request):
     if not valid_session(request):
         raise web.HTTPUnauthorized()
-    out = subprocess.run(["pbpaste"], capture_output=True, timeout=5).stdout
-    return web.Response(text=out.decode("utf-8", "replace"))
+    return web.Response(text=clip_read())
 
 
 async def clipboard_set(request):
     if not valid_session(request):
         raise web.HTTPUnauthorized()
-    text = await request.text()
-    subprocess.run(["pbcopy"], input=text.encode("utf-8"), timeout=5)
+    clip_write((await request.text())[:CLIP_MAX])
     return web.Response(text="ok")
 
 
@@ -436,7 +452,23 @@ async def ws_handler(request):
             except (ConnectionResetError, RuntimeError):
                 break
 
+    async def clip_watcher():
+        # Mac panosu değişince metni istemciye gönder (Mac → Windows).
+        count = clip_count()
+        while not ws.closed:
+            await asyncio.sleep(0.4)
+            c = clip_count()
+            if c == count:
+                continue
+            count = c
+            text = clip_read()
+            if text and text != state["clip"] and len(text) <= CLIP_MAX:
+                state["clip"] = text
+                await ws.send_str(json.dumps({"t": "clip", "s": text}))
+
+    state["clip"] = clip_read()
     task = asyncio.create_task(sender())
+    clip_task = asyncio.create_task(clip_watcher())
     try:
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
@@ -451,6 +483,12 @@ async def ws_handler(request):
                 state["max_width"] = int(m.get("max_width", 0)) or 0
                 state["force"] = True
                 wake.set()
+            elif t == "clip":
+                # Windows → Mac. Aynı metni geri göndermemek için state["clip"]'e yazılır.
+                text = str(m.get("s", ""))[:CLIP_MAX]
+                if text and text != state["clip"]:
+                    state["clip"] = text
+                    clip_write(text)
             else:
                 try:
                     handle_input(m)
@@ -458,6 +496,7 @@ async def ws_handler(request):
                     log.exception("Giriş olayı işlenemedi: %s", m)
     finally:
         task.cancel()
+        clip_task.cancel()
         INPUT.release_all()
         log.info("Bağlantı kapandı: %s", request.remote)
     return ws
